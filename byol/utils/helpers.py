@@ -106,11 +106,13 @@ def l2_weight_regularizer(params):
   return 0.5 * l2_norm
 
 
-def regression_loss(x: jnp.ndarray, y: jnp.ndarray) -> jnp.ndarray:
+def normalized_l2_loss(x: jnp.ndarray, y: jnp.ndarray) -> jnp.ndarray:
   """Byol's regression loss. This is a simple cosine similarity."""
   normed_x, normed_y = l2_normalize(x, axis=-1), l2_normalize(y, axis=-1)
   return jnp.sum((normed_x - normed_y)**2, axis=-1)
 
+def l1_loss(x: jnp.ndarray, y: jnp.ndarray) -> jnp.ndarray:
+  return jnp.mean(jnp.abs(x - y), axis=-1)
 
 def bcast_local_devices(value):
   """Broadcasts an object to all local devices."""

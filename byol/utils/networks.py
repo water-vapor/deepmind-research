@@ -43,6 +43,27 @@ class MLP(hk.Module):
     out = jax.nn.relu(out)
     out = hk.Linear(output_size=self._output_size, with_bias=False)(out)
     return out
+  
+
+class MLPHT(hk.Module):
+  """One hidden layer perceptron, with normalization."""
+
+  def __init__(
+      self,
+      name: Text,
+      hidden_size: int,
+      output_size: int,
+      **kwargs
+  ):
+    super().__init__(name=name)
+    self._hidden_size = hidden_size
+    self._output_size = output_size
+
+  def __call__(self, inputs: jnp.ndarray, is_training: bool) -> jnp.ndarray:
+    out = hk.Linear(output_size=self._hidden_size, with_bias=True)(inputs)
+    out = jax.nn.hard_tanh(out)
+    out = hk.Linear(output_size=self._output_size, with_bias=False)(out)
+    return out
 
 
 def check_length(length, value, name):

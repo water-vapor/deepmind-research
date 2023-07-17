@@ -68,6 +68,8 @@ class ByolExperiment:
       evaluation_config: Mapping[Text, Any],
       checkpointing_config: Mapping[Text, Any],
       disable_momentum: bool = False,
+      bp_proj: bool = False,
+      loss: str = 'nc',
       **kwargs,
       ):
     """Constructs the experiment.
@@ -99,6 +101,8 @@ class ByolExperiment:
     self._optimizer_config = optimizer_config
     self._evaluation_config = evaluation_config
     self._disable_momentum = disable_momentum
+    self._bp_proj = bp_proj
+    self._loss = loss
 
     # Checkpointed experiment state.
     self._byol_state = None
@@ -155,11 +159,18 @@ class ByolExperiment:
         bn_config=bn_config,
         **encoder_config)
 
-    projector = networks.MLP(
-        name='projector',
-        hidden_size=projector_hidden_size,
-        output_size=projector_output_size,
-        bn_config=bn_config)
+    if self._bp_proj:
+      projector = networks.MLPHT(
+          name='projector',
+          hidden_size=projector_hidden_size,
+          output_size=projector_output_size,
+      )
+    else:
+      projector = networks.MLP(
+          name='projector',
+          hidden_size=projector_hidden_size,
+          output_size=projector_output_size,
+          bn_config=bn_config)
     predictor = networks.MLP(
         name='predictor',
         hidden_size=predictor_hidden_size,
@@ -433,10 +444,16 @@ class ByolExperiment:
     # The stop_gradient is not necessary as we explicitly take the gradient with
     # respect to online parameters only in `optax.apply_updates`. We leave it to
     # indicate that gradients are not backpropagated through the target network.
-    repr_loss = helpers.regression_loss(
+    if self._loss == 'nc':
+      regression_loss = helpers.normalized_l2_loss
+    elif self._loss == 'l1':
+      regression_loss = helpers.l1_loss
+    else:
+      raise ValueError(f'Unknown loss: {self._loss}')
+    repr_loss = regression_loss(
         online_network_out['prediction_view1'],
         jax.lax.stop_gradient(target_network_out['projection_view2']))
-    repr_loss = repr_loss + helpers.regression_loss(
+    repr_loss = repr_loss + regression_loss(
         online_network_out['prediction_view2'],
         jax.lax.stop_gradient(target_network_out['projection_view1']))
 

@@ -44,6 +44,8 @@ flags.DEFINE_integer('log_tensors_interval', 60, 'Log tensors every n seconds.')
 flags.DEFINE_string('predictor_mode', 'byol', 'Name of the predictor to use.')
 flags.DEFINE_string('optimizer', 'lars', 'Name of the optimizer to use.')
 flags.DEFINE_bool('disable_momentum', False, 'Disable momentum in optimizer.')
+flags.DEFINE_bool('bp_proj', False, 'Use HardTanh+no BN projection head')
+flags.DEFINE_string('loss', 'nc', 'Name of the loss to use.')
 
 FLAGS = flags.FLAGS
 
@@ -88,7 +90,7 @@ def train_loop(experiment_class: Experiment, config: Mapping[Text, Any]):
 
     # Perform a training step and get scalars to log.
     scalars = experiment.step(global_step=step_device, rng=step_rng_device)
-    pbar.set_postfix({'loss': scalars['loss'], 'top1_acc': scalars['top5_accuracy']})
+    pbar.set_postfix({'loss': scalars['loss'], 'top1_acc': scalars['top1_accuracy']})
     # Checkpointing and logging.
     if config['checkpointing_config']['use_checkpointing']:
       experiment.save_checkpoint(step, rng)
@@ -155,6 +157,8 @@ def main(_):
   config['pretrain_epochs'] = FLAGS.pretrain_epochs
   config['optimizer_config']['name'] = FLAGS.optimizer
   config['disable_momentum'] = FLAGS.disable_momentum
+  config['bp_proj'] = FLAGS.bp_proj
+  config['loss'] = FLAGS.loss
 
   if FLAGS.worker_mode == 'train':
     train_loop(experiment_class, config)
