@@ -66,7 +66,10 @@ class ByolExperiment:
       optimizer_config: Mapping[Text, Any],
       lr_schedule_config: Mapping[Text, Any],
       evaluation_config: Mapping[Text, Any],
-      checkpointing_config: Mapping[Text, Any]):
+      checkpointing_config: Mapping[Text, Any],
+      disable_momentum: bool = False,
+      **kwargs,
+      ):
     """Constructs the experiment.
 
     Args:
@@ -95,6 +98,7 @@ class ByolExperiment:
     self._base_target_ema = base_target_ema
     self._optimizer_config = optimizer_config
     self._evaluation_config = evaluation_config
+    self._disable_momentum = disable_momentum
 
     # Checkpointed experiment state.
     self._byol_state = None
@@ -123,6 +127,7 @@ class ByolExperiment:
       encoder_config: Mapping[Text, Any],
       bn_config: Mapping[Text, Any],
       is_training: bool,
+      predictor_mode: str,
   ) -> Mapping[Text, jnp.ndarray]:
     """Forward application of byol's architecture.
 
@@ -162,6 +167,8 @@ class ByolExperiment:
         bn_config=bn_config)
     classifier = hk.Linear(
         output_size=self._num_classes, name='classifier')
+    closed_form_predictor_ema_1 = hk.get_state('closed_form_predictor_ema_1', shape=[projector_output_size,projector_output_size], dtype=jnp.float32, init=jnp.zeros)
+    closed_form_predictor_ema_2 = hk.get_state('closed_form_predictor_ema_2', shape=[projector_output_size,projector_output_size], dtype=jnp.float32, init=jnp.zeros)
 
     def apply_once_fn(images: jnp.ndarray, suffix: Text = ''):
       images = dataset.normalize_images(images)
@@ -178,21 +185,207 @@ class ByolExperiment:
       outputs['prediction' + suffix] = pred_out
       outputs['logits' + suffix] = classif_out
       return outputs
+    
+    def apply_twice_fn(image1: jnp.ndarray, image2: jnp.ndarray):
+      image1 = dataset.normalize_images(image1)
+      image2 = dataset.normalize_images(image2)
+
+      embedding1 = net(image1, is_training=is_training)
+      embedding2 = net(image2, is_training=is_training)
+      proj_out1 = projector(embedding1, is_training)
+      proj_out2 = projector(embedding2, is_training)
+
+      pred_out1 = predictor(proj_out1, is_training)
+      pred_out2 = predictor(proj_out2, is_training)
+
+      # Note the stop_gradient: label information is not leaked into the
+      # main network.
+      classif_out1 = classifier(jax.lax.stop_gradient(embedding1))
+      classif_out2 = classifier(jax.lax.stop_gradient(embedding2))
+      outputs = {}
+      outputs['projection_view1'] = proj_out1
+      outputs['projection_view2'] = proj_out2
+      outputs['prediction_view1'] = pred_out1
+      outputs['prediction_view2'] = pred_out2
+      outputs['logits_view1'] = classif_out1
+      outputs['logits_view2'] = classif_out2
+      return outputs
+    
+    def ne_predictor(zt, zx):
+      zttzx = jax.numpy.matmul(jax.numpy.transpose(zt), zx)
+      p = 2.0 * zttzx
+      p -= jax.numpy.matmul( jax.numpy.transpose(zt), jax.numpy.matmul(zt, zttzx))
+      return p
+    
+    def visser(m, n, eta):
+      p = 1/(2.0 * eta) * jax.numpy.eye(m.shape[0])
+      for _ in range(n):
+        p += eta * (m - jax.numpy.matmul(p, p))
+      return p
+    
+    def newtonschulz(m, n):
+      a=m
+      fronorm_a = jax.numpy.linalg.norm(a, 'fro') 
+      a /= fronorm_a
+      b = jax.numpy.eye(m.shape[0])
+      c = 3.0 * b
+      for _ in range(n):
+        ba = jax.numpy.matmul(b, a)
+        a = 0.5 * jax.numpy.matmul(a, c - ba)
+        b = 0.5 * jax.numpy.matmul(c - ba, b)
+      a *= jax.numpy.sqrt(fronorm_a)
+      b /= jax.numpy.sqrt(fronorm_a)
+      return a, b
+    
+    def stiefel(m, n):
+      x = m.transpose()
+      xxt = jax.numpy.matmul(x, m)
+      xxt /= m.shape[0]
+      x_inv_sqrt = newtonschulz(xxt, n)[1]
+      x_inv_sqrt /= jax.numpy.linalg.norm(x_inv_sqrt, ord='fro')
+      p = jax.numpy.matmul(x_inv_sqrt, x)
+      return p
+    
+    def lrp(zt, zx, safe_eps=1e-12):
+      normfactor = 0.5 * jax.numpy.linalg.norm(zt, ord='fro')
+      normfactor += 0.5 * jax.numpy.linalg.norm(zx, ord='fro') + safe_eps
+      p = jax.numpy.matmul(jax.numpy.linalg.pinv(zt/normfactor), zx/normfactor)
+      return p
+    
+    def direct_copy(zt):
+      return jax.numpy.matmul(jax.numpy.transpose(zt), zt)
+    
+    def apply_twice_cfp_fn(image1: jnp.ndarray, image2: jnp.ndarray):
+      image1 = dataset.normalize_images(image1)
+      image2 = dataset.normalize_images(image2)
+
+      embedding1 = net(image1, is_training=is_training)
+      embedding2 = net(image2, is_training=is_training)
+      proj_out1 = projector(embedding1, is_training)
+      proj_out2 = projector(embedding2, is_training)
+
+      if predictor_mode == 'byol':
+        pred_out1 = predictor(proj_out1, is_training)
+        pred_out2 = predictor(proj_out2, is_training)
+
+      else:
+
+        if predictor_mode == 'directcopy':
+          closed_form_predictor1 = direct_copy(proj_out1)
+          closed_form_predictor2 = direct_copy(proj_out2)
+
+        # one version of LRP
+        # closed_form_predictor1 = jax.numpy.linalg.inv(proj_out1.T @ proj_out1) @ proj_out1.T @ proj_out2
+        # closed_form_predictor2 = jax.numpy.linalg.inv(proj_out2.T @ proj_out2) @ proj_out2.T @ proj_out1
+
+        elif predictor_mode == 'lrp':
+          # paper version of LRP
+          closed_form_predictor1 = lrp(proj_out1, proj_out2)
+          closed_form_predictor2 = lrp(proj_out2, proj_out1)
+
+
+        elif predictor_mode == 'ne':
+          # NE predictor
+          z1 = proj_out1/jnp.linalg.norm(proj_out1, ord=2)
+          z2 = proj_out2/jnp.linalg.norm(proj_out2, ord=2)
+          p1 = ne_predictor(z1, z2)
+          p2 = ne_predictor(z2, z1)
+          closed_form_predictor1 = p1/jnp.linalg.norm(p1, ord=2)
+          closed_form_predictor2 = p2/jnp.linalg.norm(p2, ord=2)
+
+        elif predictor_mode == 'visser':
+          # visser predictor
+          sigma1 = jax.numpy.matmul(jax.numpy.transpose(proj_out1), proj_out1)
+          sigma2 = jax.numpy.matmul(jax.numpy.transpose(proj_out2), proj_out2)
+          closed_form_predictor1 = visser(sigma1, 50, 0.001)
+          closed_form_predictor2 = visser(sigma2, 50, 0.001)
+
+        elif predictor_mode == 'newtonschulz':
+          # newtonschulz predictor
+          sigma1 = jax.numpy.matmul(jax.numpy.transpose(proj_out1), proj_out1)
+          sigma2 = jax.numpy.matmul(jax.numpy.transpose(proj_out2), proj_out2)
+          closed_form_predictor1 = newtonschulz(sigma1, 9)[0]
+          closed_form_predictor2 = newtonschulz(sigma2, 9)[0]
+
+        elif predictor_mode == 'stiefel':
+          # stiefel predictor
+          sigma1 = jax.numpy.matmul(jax.numpy.transpose(proj_out1), proj_out1)
+          sigma2 = jax.numpy.matmul(jax.numpy.transpose(proj_out2), proj_out2)
+          closed_form_predictor1 = stiefel(sigma1, 9)
+          closed_form_predictor2 = stiefel(sigma2, 9)
+
+        else:
+          raise ValueError('predictor_mode not recognized')
+
+
+        ema_factor = 0.9
+        epsilon = 0.3
+
+        # use ema on predictors
+        # hk.set_state('closed_form_predictor_ema_1', ema_factor * closed_form_predictor_ema_1 + (1-ema_factor) * closed_form_predictor1)
+        # hk.set_state('closed_form_predictor_ema_2', ema_factor * closed_form_predictor_ema_2 + (1-ema_factor) * closed_form_predictor2)
+
+        # predictor1 = closed_form_predictor_ema_1 + epsilon * jnp.eye(projector_output_size)
+        # predictor2 = closed_form_predictor_ema_2 + epsilon * jnp.eye(projector_output_size)
+
+        # no ema on predictors
+        predictor1 = closed_form_predictor1 + epsilon * jnp.eye(projector_output_size)
+        predictor2 = closed_form_predictor2 + epsilon * jnp.eye(projector_output_size)
+
+        # use gradients on predictors
+        # pred_out1 = proj_out1 @ predictor1
+        # pred_out2 = proj_out2 @ predictor2
+
+        # no gradients on predictors
+        pred_out1 = proj_out1 @ jax.lax.stop_gradient(predictor1) 
+        pred_out2 = proj_out2 @ jax.lax.stop_gradient(predictor2) 
+
+      # Note the stop_gradient: label information is not leaked into the
+      # main network.
+      classif_out1 = classifier(jax.lax.stop_gradient(embedding1))
+      classif_out2 = classifier(jax.lax.stop_gradient(embedding2))
+      outputs = {}
+      outputs['projection_view1'] = proj_out1
+      outputs['projection_view2'] = proj_out2
+      outputs['prediction_view1'] = pred_out1
+      outputs['prediction_view2'] = pred_out2
+      outputs['logits_view1'] = classif_out1
+      outputs['logits_view2'] = classif_out2
+      return outputs
 
     if is_training:
-      outputs_view1 = apply_once_fn(inputs['view1'], '_view1')  # pytype: disable=wrong-arg-types  # jax-ndarray
-      outputs_view2 = apply_once_fn(inputs['view2'], '_view2')  # pytype: disable=wrong-arg-types  # jax-ndarray
-      return {**outputs_view1, **outputs_view2}
+      # outputs_view1 = apply_once_fn(inputs['view1'], '_view1')  # pytype: disable=wrong-arg-types  # jax-ndarray
+      # outputs_view2 = apply_once_fn(inputs['view2'], '_view2')  # pytype: disable=wrong-arg-types  # jax-ndarray
+      # return {**outputs_view1, **outputs_view2}
+      # return apply_twice_fn(inputs['view1'], inputs['view2'])
+      return apply_twice_cfp_fn(inputs['view1'], inputs['view2'])
     else:
       return apply_once_fn(inputs['images'], '')  # pytype: disable=wrong-arg-types  # jax-ndarray
 
   def _optimizer(self, learning_rate: float) -> optax.GradientTransformation:
     """Build optimizer from config."""
-    return optimizers.lars(
-        learning_rate,
-        weight_decay_filter=optimizers.exclude_bias_and_norm,
-        lars_adaptation_filter=optimizers.exclude_bias_and_norm,
-        **self._optimizer_config)
+    if self._optimizer_config['name'] == 'lars':
+      return optimizers.lars(
+          learning_rate,
+          weight_decay_filter=optimizers.exclude_bias_and_norm,
+          lars_adaptation_filter=optimizers.exclude_bias_and_norm,
+          weight_decay=self._optimizer_config['weight_decay'],
+          momentum=self._optimizer_config['momentum'],
+          eta=self._optimizer_config['eta'],)
+    elif self._optimizer_config['name'] == 'sgd':
+      return optax.chain(
+          optax.add_decayed_weights(self._optimizer_config['weight_decay']),
+          optax.sgd(
+            learning_rate=learning_rate,
+            momentum=self._optimizer_config['momentum'])
+            )
+    elif self._optimizer_config['name'] == 'adam':
+      return optax.adam(learning_rate=1e-3)
+    else:
+      raise ValueError(f'Unknown optimizer: {self._optimizer_config["name"]}')
+    
+
+      
 
   def loss_fn(
       self,
@@ -339,6 +532,8 @@ class ByolExperiment:
         global_step,
         base_ema=self._base_target_ema,
         max_steps=self._max_steps)
+    if self._disable_momentum:
+      tau = 0.
     target_params = jax.tree_map(lambda x, y: x + (1 - tau) * (y - x),
                                       target_params, online_params)
     logs['tau'] = tau

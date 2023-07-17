@@ -24,6 +24,9 @@ from absl import logging
 import jax
 import numpy as np
 
+import pandas as pd
+from tqdm import tqdm
+
 from byol import byol_experiment
 from byol import eval_experiment
 from byol.configs import byol as byol_config
@@ -38,6 +41,9 @@ flags.DEFINE_integer('batch_size', 4096, 'Total batch size')
 flags.DEFINE_string('checkpoint_root', '/tmp/byol',
                     'The directory to save checkpoints to.')
 flags.DEFINE_integer('log_tensors_interval', 60, 'Log tensors every n seconds.')
+flags.DEFINE_string('predictor_mode', 'byol', 'Name of the predictor to use.')
+flags.DEFINE_string('optimizer', 'lars', 'Name of the optimizer to use.')
+flags.DEFINE_bool('disable_momentum', False, 'Disable momentum in optimizer.')
 
 FLAGS = flags.FLAGS
 
@@ -71,7 +77,8 @@ def train_loop(experiment_class: Experiment, config: Mapping[Text, Any]):
       step, rng = checkpoint_data
 
   local_device_count = jax.local_device_count()
-  while step < config['max_steps']:
+  results = []
+  for step in (pbar:=tqdm(range(config['max_steps']))):
     step_rng, rng = tuple(jax.random.split(rng))
     # Broadcast the random seeds across the devices
     step_rng_device = jax.random.split(step_rng, num=jax.device_count())
@@ -81,17 +88,15 @@ def train_loop(experiment_class: Experiment, config: Mapping[Text, Any]):
 
     # Perform a training step and get scalars to log.
     scalars = experiment.step(global_step=step_device, rng=step_rng_device)
-
+    pbar.set_postfix({'loss': scalars['loss'], 'top1_acc': scalars['top5_accuracy']})
     # Checkpointing and logging.
     if config['checkpointing_config']['use_checkpointing']:
       experiment.save_checkpoint(step, rng)
-      current_time = time.time()
-      if current_time - last_logging > FLAGS.log_tensors_interval:
-        logging.info('Step %d: %s', step, scalars)
-        last_logging = current_time
-    step += 1
-  logging.info('Saving final checkpoint')
-  logging.info('Step %d: %s', step, scalars)
+    scalars_normal = {k:v.item() for k,v in scalars.items()}
+    scalars_normal['step'] = step
+    results.append(scalars_normal)
+  results_df = pd.DataFrame(results)
+  results_df.to_csv(f"experiment_logs_{config['network_config']['predictor_mode']}_{config['pretrain_epochs']}_{config['optimizer_config']['name']}_{'nm' if config['disable_momentum'] else 'wm'}.csv")
   experiment.save_checkpoint(step, rng)
 
 
@@ -146,6 +151,10 @@ def main(_):
   else:
     raise ValueError(f'Unknown experiment mode: {FLAGS.experiment_mode}')
   config['checkpointing_config']['checkpoint_dir'] = FLAGS.checkpoint_root  # pytype: disable=unsupported-operands  # dict-kwargs
+  config['network_config']['predictor_mode'] = FLAGS.predictor_mode  
+  config['pretrain_epochs'] = FLAGS.pretrain_epochs
+  config['optimizer_config']['name'] = FLAGS.optimizer
+  config['disable_momentum'] = FLAGS.disable_momentum
 
   if FLAGS.worker_mode == 'train':
     train_loop(experiment_class, config)
